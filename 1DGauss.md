@@ -106,3 +106,158 @@ $$
 $$
 
 したがって、平均が $\mu$ で分散が $1.0$ の正規分布 $p(\mu, 1.0)$ と平均が $0$ で分散が $1.0$ の正規分布 $q(0,1)$ のKLダイバージェンスは $\frac{1}{2} \mu^2$ となります。
+
+
+## 平均が$\mu$で分散が$1.0$の正規分布を中間層の表現に用いるVariational Autoencoder
+
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.decomposition import PCA
+
+# ハイパーパラメータ
+batch_size = 128
+latent_dim = 2  # 中間層の次元
+epochs = 50
+learning_rate = 1e-3
+
+# MNISTデータセットの読み込みとデータローダーの作成
+transform = transforms.ToTensor()
+train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+# VAEモデルの定義（中間層の分散を固定）
+class VAE(nn.Module):
+    def __init__(self, latent_dim):
+        super(VAE, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(7*7*32, 256),
+            nn.ReLU(),
+            nn.Linear(256, latent_dim)  # 平均 μ のみを出力
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 7*7*32),
+            nn.ReLU(),
+            nn.Unflatten(1, (32, 7, 7)),
+            nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(16, 1, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.Sigmoid()
+        )
+
+    def encode(self, x):
+        mu = self.encoder(x)
+        # 分散は固定で 1.0 なので、logvar は 0
+        logvar = torch.zeros_like(mu)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        return z
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        x_recon = self.decode(z)
+        return x_recon, mu, logvar
+
+# モデル、損失関数、最適化手法の定義
+model = VAE(latent_dim)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+def loss_function(recon_x, x, mu, logvar):
+    BCE = nn.functional.binary_cross_entropy(recon_x.view(-1, 784), x.view(-1, 784), reduction='sum')
+    # 事前分布 p(z) は平均 0、分散 1 の正規分布
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return BCE + KLD
+
+# 学習ループ
+train_losses = []
+for epoch in range(epochs):
+    model.train()
+    train_loss = 0
+    for batch_idx, (data, _) in enumerate(train_loader):
+        optimizer.zero_grad()
+        recon_batch, mu, logvar = model(data)
+        loss = loss_function(recon_batch, data, mu, logvar)
+        loss.backward()
+        train_loss += loss.item()
+        optimizer.step()
+    train_losses.append(train_loss / len(train_loader.dataset))
+    print(f'Epoch {epoch+1}, Loss: {train_losses[-1]:.4f}')
+
+# 学習曲線のプロット
+plt.plot(train_losses)
+plt.title('VAE Training Loss (Fixed Variance)')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.show()
+
+# 中間層の表現の可視化 (PCA適用)
+model.eval()
+z_list = []
+labels_list = []
+with torch.no_grad():
+    for data, labels in train_loader:
+        mu, logvar = model.encode(data)
+        z = model.reparameterize(mu, logvar)
+        z_list.extend(z.cpu().numpy())
+        labels_list.extend(labels.cpu().numpy())
+z_list = np.array(z_list)
+labels_list = np.array(labels_list)
+
+pca = PCA(n_components=2)
+z_pca = pca.fit_transform(z_list)
+
+plt.figure(figsize=(10, 8))
+plt.scatter(z_pca[:, 0], z_pca[:, 1], c=labels_list, cmap='viridis', s=5)
+plt.colorbar()
+plt.title('Latent Space Visualization (PCA, Fixed Variance)')
+plt.xlabel('Principal Component 1')
+plt.ylabel('Principal Component 2')
+plt.show()
+
+# いくつかのサンプルに対する入力画像とその画像に対する予測画像を可視化
+n = 10
+plt.figure(figsize=(20, 4))
+for i in range(n):
+    with torch.no_grad():
+        sample = train_dataset[i][0].unsqueeze(0)
+        recon_sample, _, _ = model(sample)
+    plt.subplot(2, n, i+1)
+    plt.imshow(sample.squeeze().numpy(), cmap='gray')
+    plt.title('Input')
+    plt.axis('off')
+    plt.subplot(2, n, i+n+1)
+    plt.imshow(recon_sample.squeeze().numpy(), cmap='gray')
+    plt.title('Reconstruction')
+    plt.axis('off')
+plt.show()
+```
+
+**プログラムのポイント:**
+
+1.  **エンコーダの出力:** エンコーダの最終層の出力は、潜在変数の平均 $\mu$ のみになります。分散は固定で $1.0$ なので、対応する対数分散 `logvar` は常に $0$ となります。
+2.  **`encode` 関数:** `encode` 関数内では、平均 $\mu$ を計算し、`logvar` を `torch.zeros_like(mu)` で初期化しています。
+3.  **`reparameterize` 関数:** 分散が $1.0$ なので、標準偏差 $\sigma$ は $\sqrt{1.0} = 1.0$ となり、潜在変数 $z$ は $z = \mu + 1.0 \cdot \epsilon = \mu + \epsilon$ で計算されます。
+4.  **損失関数 (`loss_function`):** KLダイバージェンスの計算では、固定された分散 $1.0$ (つまり $\log \sigma^2 = \log 1 = 0$) を考慮した式になります。事前分布も平均 $0$、分散 $1$ の正規分布であるため、KLダイバージェンスは $\frac{1}{2} \sum (\mu^2)$ と簡略化されます。ただし、汎用性を持たせるために、`logvar` を明示的に $0$ として計算する形式を残しています。
+5.  **可視化:** 学習曲線、PCAによる中間層表現の散布図、入力画像と再構成画像の比較は、以前のプログラムと同様に行われます。
+
+このプログラムを実行すると、中間層の分散が固定されたVAEがMNISTデータに対して学習され、学習曲線とPCAで次元削減された中間層の表現が表示されます。また、入力画像と再構成画像が比較表示されます。
